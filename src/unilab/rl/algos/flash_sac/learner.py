@@ -221,6 +221,9 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         amp_dtype: str = "auto",
         use_compile: bool | None = None,
         compile_full_objectives: bool | None = None,
+        compile_options: Mapping[str, Any] | None = None,
+        compile_actor_inference: bool = False,
+        compile_native_batch_norm: bool = False,
         use_whole_cycle_cuda_graph: bool | None = None,
         dp_whole_cycle_cuda_graph: bool = False,
         actor_normalize_parameters: bool = True,
@@ -278,6 +281,9 @@ class FlashSACLearner(WholeCycleLearnerMixin):
             self._nvidia_cuda if compile_full_objectives is None else bool(compile_full_objectives)
         )
         self.compile_full_objectives = bool(full_objectives_requested and self.use_compile)
+        self.compile_options = dict(compile_options or {})
+        self.compile_actor_inference = bool(compile_actor_inference)
+        self.compile_native_batch_norm = bool(compile_native_batch_norm)
         # Host-side ``Tensor.item``/truth checks synchronize the device.  The
         # compiled CUDA path uses the fused optimizer's device gate; MPS has no
         # device-side skip (its fused Adam kernel ignores ``found_inf``), so
@@ -303,6 +309,11 @@ class FlashSACLearner(WholeCycleLearnerMixin):
             if use_whole_cycle_cuda_graph is None
             else bool(use_whole_cycle_cuda_graph)
         )
+        if self.compile_native_batch_norm and (graph_requested or self._dp_whole_cycle_cuda_graph):
+            raise ValueError(
+                "compile_native_batch_norm introduces explicit actor graph breaks; "
+                "set use_whole_cycle_cuda_graph=false and dp_whole_cycle_cuda_graph=false"
+            )
         if self._actor_spec is not None:
             if not self.actor_normalize_parameters:
                 raise ValueError(
@@ -438,6 +449,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         self._update_cycle_lr_cursors: dict[int, int] = {}
         self._capture_update_cycle = False
         self._update_cycle_capture_failed = False
+        self._update_cycle_replay_submitted = False
         # Whole-cycle capture wraps compiled objectives, so disabling compile
         # also disables this dependent layer.  The graph switch otherwise does
         # not change which objective boundary Inductor compiles.
@@ -457,7 +469,19 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         if self.use_compile:
             if self._compile_full_update_cycle:
                 self._materialize_capturable_optimizer_state()
+            if self.compile_native_batch_norm:
+                for module in self.actor.modules():
+                    if isinstance(module, UnitBatchNorm):
+                        module.preserve_native_execution = True
             self._compile_training_methods()
+
+    @property
+    def native_batch_norm_module_count(self) -> int:
+        """Actual actor BN modules deliberately outside compiled graphs."""
+        return sum(
+            isinstance(module, UnitBatchNorm) and module.preserve_native_execution
+            for module in self.actor.modules()
+        )
 
     @property
     def use_update_cycle(self) -> bool:
@@ -532,6 +556,14 @@ class FlashSACLearner(WholeCycleLearnerMixin):
             return
 
         if self._compile_full_update_cycle:
+            if (
+                self.compile_options
+                or self.compile_actor_inference
+                or self.compile_native_batch_norm
+            ):
+                raise ValueError(
+                    "Explicit compile options/inference require whole-cycle CUDA graphs disabled"
+                )
             # The raw whole-cycle graph must not nest Inductor CUDA Graph Trees.
             # Architecture-portable max-autotune lets Triton select kernels on
             # the installed GPU instead of restoring Ada/Blackwell learner paths.
@@ -544,8 +576,13 @@ class FlashSACLearner(WholeCycleLearnerMixin):
                 "dynamic": False,
                 "options": {
                     "triton.cudagraphs": True,
+                    **self.compile_options,
                 },
             }
+        if self.compile_actor_inference:
+            self.actor.get_mean_and_std = compile_fn(  # type: ignore[method-assign]
+                self.actor.get_mean_and_std, **compile_kwargs
+            )
         if self.compile_full_objectives:
             self._full_critic_objective = compile_fn(  # type: ignore[method-assign]
                 self._full_critic_objective, **compile_kwargs
@@ -554,9 +591,10 @@ class FlashSACLearner(WholeCycleLearnerMixin):
                 self._full_actor_objective, **compile_kwargs
             )
             return
-        self.actor.get_mean_and_std = compile_fn(  # type: ignore[method-assign]
-            self.actor.get_mean_and_std, **compile_kwargs
-        )
+        if not self.compile_actor_inference:
+            self.actor.get_mean_and_std = compile_fn(  # type: ignore[method-assign]
+                self.actor.get_mean_and_std, **compile_kwargs
+            )
         self.__dict__["_critic_objective"] = compile_fn(
             self._critic_objective,
             **compile_kwargs,
@@ -738,7 +776,10 @@ class FlashSACLearner(WholeCycleLearnerMixin):
             )
             for aux_loss in aux_losses.values():
                 actor_loss = actor_loss + aux_loss
-        return actor_loss, entropy, dict(aux_losses)
+        # These outputs are diagnostics only. Keep their original tensors in
+        # actor_loss, but do not expose unused differentiable outputs to AOT
+        # backward (actor-owned detached health aliases can leave None tangents).
+        return actor_loss, entropy, {name: loss.detach() for name, loss in aux_losses.items()}
 
     def update_critic(
         self,
@@ -863,18 +904,24 @@ class FlashSACLearner(WholeCycleLearnerMixin):
             self.temperature_scheduler.step()
 
         post_update_temperature = self.temperature()
-        actor_metric_tensors = (actor_loss, entropy, post_update_temperature, temp_loss)
+        aux_metric_names = tuple(f"Loss/aux_{name}" for name in aux_names)
+        aux_metric_tensors = tuple(aux_losses[name] for name in aux_names)
+        actor_metric_tensors = (
+            actor_loss,
+            entropy,
+            post_update_temperature,
+            temp_loss,
+            *aux_metric_tensors,
+        )
         if not read_metrics:
             # Keep a private device-side snapshot.  The cycle-end drain below
             # performs the only D2H read, after all compiled replays finish.
-            # Auxiliary-loss diagnostics only exist on the metrics-reading
-            # path; their values remain part of Loss/actor here.
+            # Preserve named custom-actor diagnostics in the same deferred
+            # transfer; this does not change the actor objective or gradients.
             self._pending_actor_metric_values = torch.stack(
                 [tensor.detach().reshape(()) for tensor in actor_metric_tensors]
             )
             return {}
-        aux_metric_names = tuple(f"Loss/aux_{name}" for name in aux_names)
-        aux_metric_tensors = tuple(aux_losses[name] for name in aux_names)
         return self._read_metric_tensors(
             (
                 "Loss/actor",
@@ -883,7 +930,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
                 "Loss/temperature",
                 *aux_metric_names,
             ),
-            (*actor_metric_tensors, *aux_metric_tensors),
+            actor_metric_tensors,
         )
 
     @staticmethod
@@ -907,6 +954,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
                     "Loss/entropy",
                     "Policy/temperature",
                     "Loss/temperature",
+                    *(f"Loss/aux_{name}" for name in (self._aux_loss_names or ())),
                 ),
                 values.cpu().tolist(),
                 strict=True,
@@ -1091,12 +1139,14 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         if self._gradient_graph_hooks is not None:
             self._gradient_graph_hooks[2]()
         self._update_cycle_graph.replay()
+        self._update_cycle_replay_submitted = True
         self._advance_update_cycle_schedulers()
         self._pending_cycle_metric_values = self._update_cycle_graph_metric_values
 
     def _reset_update_cycle_graph(self) -> None:
         """Invalidate captured storage after checkpoint or DP state changes."""
         self._update_cycle_capture_failed = False
+        self._update_cycle_replay_submitted = False
         self._update_cycle_graph = None
         self._update_cycle_graph_cache_key = None
         self._update_cycle_static_batch = None

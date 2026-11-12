@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import os
 import queue as queue_module
 import statistics
 import time
 from collections import defaultdict, deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import replace
 from functools import partial
@@ -45,6 +46,16 @@ from unilab.rl.runtime.ipc.replay_pipelines.device import (
 )
 from unilab.rl.runtime.offpolicy.actor_adapter import get_offpolicy_actor_adapter
 from unilab.rl.runtime.offpolicy.coordination import LearnerCoordinationState
+from unilab.rl.runtime.offpolicy.lifecycle import (
+    LifecycleContext,
+    LifecycleHook,
+    checkpoint_hook_state,
+    publish_lifecycle_state,
+    publish_retention_check,
+    restore_hook_state,
+    validate_checkpoint_iterations,
+    validate_hook,
+)
 from unilab.rl.runtime.offpolicy.runner import (
     OffPolicyRunner,
     build_offpolicy_sample_info,
@@ -479,6 +490,16 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 getattr(self.learner, "_host_finite_checks", True)
             ),
         }
+        if hasattr(self.learner, "compile_native_batch_norm"):
+            manifest["compile_native_batch_norm"] = bool(self.learner.compile_native_batch_norm)
+            manifest["native_batch_norm_module_count"] = int(
+                self.learner.native_batch_norm_module_count
+            )
+            manifest["intentional_graph_breaks"] = (
+                ["actor.UnitBatchNorm: native forward/backward"]
+                if self.learner.native_batch_norm_module_count
+                else []
+            )
         if bool(getattr(self.learner, "use_update_cycle", False)):
             manifest["scope"] = "update_cycle"
             manifest["orchestration"] = "cuda_graph"
@@ -487,7 +508,74 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             manifest["orchestration"] = (
                 "torch_compile" if backend == "torch_compile" else "inductor_cuda_graph_trees"
             )
+        if compile_enabled and hasattr(self.learner, "compile_options"):
+            options = dict(self.learner.compile_options)
+            manifest["compile_options"] = options
+            manifest["compile_full_objectives"] = bool(self.learner.compile_full_objectives)
+            manifest["compile_actor_inference"] = bool(self.learner.compile_actor_inference)
+            manifest["compiled_wrappers"] = {
+                name: hasattr(function, "_torchdynamo_orig_callable")
+                for name, function in (
+                    ("inference", self.learner.actor.get_mean_and_std),
+                    ("actor", self.learner._full_actor_objective),
+                    ("critic", self.learner._full_critic_objective),
+                )
+            }
+            from torch._dynamo.utils import counters
+
+            manifest["compile_counters"] = {
+                group: {str(key): int(value) for key, value in entries.items()}
+                for group, entries in counters.items()
+            }
+            if not bool(getattr(self.learner, "use_update_cycle", False)):
+                if self.learner.compile_full_objectives:
+                    manifest["scope"] = (
+                        "full_objectives_with_native_batch_norm"
+                        if getattr(self.learner, "native_batch_norm_module_count", 0)
+                        else "full_objectives"
+                    )
+                if options.get("triton.cudagraphs") is False:
+                    manifest["orchestration"] = "torch_compile"
+        if hasattr(self.learner, "_update_cycle_graph"):
+            manifest["whole_cycle_graph_present"] = (
+                getattr(self.learner, "_update_cycle_graph", None) is not None
+            )
+            manifest["whole_cycle_capture_failed"] = bool(
+                getattr(self.learner, "_update_cycle_capture_failed", False)
+            )
+        if hasattr(self.learner, "_update_cycle_replay_submitted"):
+            manifest["whole_cycle_replay_submitted"] = bool(
+                getattr(self.learner, "_update_cycle_replay_submitted", False)
+            )
         return manifest
+
+    def _persist_runtime_manifest_snapshot(
+        self,
+        log_dir: str,
+        *,
+        phase: str,
+        iteration: int | None = None,
+    ) -> None:
+        """落盘每个 rank 的已观测状态，避免限时停止丢失最终 summary。"""
+        rank = 0 if self.dp_sync is None else self.dp_sync.rank
+        directory = Path(log_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        destination = directory / f"runtime_manifest.rank{rank}.json"
+        temporary = directory / f".{destination.name}.{os.getpid()}.tmp"
+        payload = {
+            "snapshot_schema_version": 1,
+            "rank": rank,
+            "pid": os.getpid(),
+            "phase": phase,
+            "iteration": iteration,
+            "unix_time": time.time(),
+            "runtime_manifest": self.runtime_manifest,
+        }
+        try:
+            temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            temporary.replace(destination)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _learner_performance_tier_manifest(self) -> dict[str, object] | None:
         tier = getattr(self.learner, "_performance_tier", None)
@@ -969,7 +1057,19 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         if not self._is_primary_rank():
             return None
         ckpt_path = os.path.join(log_dir, f"model_{iteration}.pt")
-        torch.save(self.learner.get_state_dict(), ckpt_path)
+        state = dict(self.learner.get_state_dict())
+        lifecycle_state = checkpoint_hook_state(getattr(self, "_lifecycle_hook", None), iteration)
+        if lifecycle_state is not None:
+            state["lifecycle_state"] = lifecycle_state
+            temporary = f"{ckpt_path}.{os.getpid()}.tmp"
+            try:
+                torch.save(state, temporary)
+                os.replace(temporary, ckpt_path)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+        else:
+            torch.save(state, ckpt_path)
         logger.log_save(ckpt_path)
         return ckpt_path
 
@@ -994,11 +1094,112 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             )
 
         self.learner.load_state_dict(state)
+        restore_hook_state(
+            getattr(self, "_lifecycle_hook", None), state.get("lifecycle_state"), update_count
+        )
         print(
             f"Resumed learner state from {resume_checkpoint} "
             f"(update_count={update_count}, next_iteration={update_count + 1})"
         )
         return update_count + 1
+
+    def _lifecycle_context(
+        self, *, phase: str, iteration: int, log_dir: str, checkpoint_path: str | None = None
+    ) -> LifecycleContext:
+        return LifecycleContext(
+            phase=cast(Any, phase),
+            learner=self.learner,
+            iteration=iteration,
+            rank=0 if self.dp_sync is None else self.dp_sync.rank,
+            world_size=1 if self.dp_sync is None else self.dp_sync.world_size,
+            log_dir=str(Path(log_dir).resolve()),
+            checkpoint_path=checkpoint_path,
+        )
+
+    def _checkpoint_lifecycle(
+        self,
+        *,
+        iteration: int,
+        log_dir: str,
+        replay_pipeline,
+        wait_for_request: Callable[[], int],
+    ) -> int:
+        """Hold the next inference request until the owner checkpoint hook returns."""
+        hook = self._lifecycle_hook
+        if hook is None:
+            raise RuntimeError("Checkpoint lifecycle requires an injected hook")
+        checkpoint_path = str((Path(log_dir) / f"model_{iteration}.pt").resolve())
+        context = self._lifecycle_context(
+            phase="checkpoint",
+            iteration=iteration,
+            log_dir=log_dir,
+            checkpoint_path=checkpoint_path,
+        )
+        publish_lifecycle_state(context, "checkpoint_wait")
+        pause_started = time.monotonic()
+        stop_reasons: list[str] = []
+
+        def request_stop(reason: str) -> None:
+            if stop_reasons and stop_reasons[0] != reason:
+                raise ValueError("Conflicting lifecycle stop requests")
+            stop_reasons.append(reason)
+
+        try:
+            # Consume, but do not answer, the next request. That proves the
+            # collector completed its in-flight transition and published replay.
+            # Retain the tick for the ordinary next iteration; never requeue it.
+            held_tick = wait_for_request()
+            self._learner_coordination.mark_busy()
+
+            def retained_state() -> dict[str, Any]:
+                phase, progress = self._learner_coordination.snapshot()
+                return {
+                    "collector_held_tick": held_tick,
+                    "learner_phase": int(phase),
+                    "learner_progress": progress,
+                    "learner_update_count": getattr(self.learner, "update_count", None),
+                    "replay": replay_pipeline.retained_state(),
+                }
+
+            with replay_pipeline.paused():
+                sync_device(self.device)
+                if self.dp_sync is not None:
+                    self.dp_sync.barrier()
+                # Rank 0 saved atomically before entering the shared boundary.
+                checkpoint = Path(checkpoint_path).stat()
+                context = replace(
+                    context,
+                    checkpoint_token=f"{iteration}:{checkpoint.st_mtime_ns}:{checkpoint.st_size}",
+                    retained_state=retained_state(),
+                )
+                context = replace(
+                    context,
+                    progress_publisher=partial(publish_lifecycle_state, context, "checkpoint_hook"),
+                    stop_request=request_stop,
+                )
+                context.publish_progress()
+                hook(context)
+                if not publish_retention_check(context, retained_state()):
+                    raise RuntimeError("Checkpoint hook changed retained training/replay state")
+                # Long work must be host-coordinated by the hook so all ranks
+                # return together; this collective is only a short exit fence.
+                reason = stop_reasons[0] if stop_reasons else None
+                if self.dp_sync is not None:
+                    reason = self.dp_sync.agree_stop_reason(reason)
+                self._lifecycle_stop_reason = reason
+            publish_lifecycle_state(
+                context,
+                "stopping" if reason is not None else "running",
+                {"stop_reason": reason} if reason is not None else None,
+            )
+            return held_tick
+        except BaseException as exc:
+            publish_lifecycle_state(context, "failed", {"error": repr(exc)})
+            raise
+        finally:
+            self._lifecycle_pause_seconds = getattr(self, "_lifecycle_pause_seconds", 0.0) + (
+                time.monotonic() - pause_started
+            )
 
     def close(self) -> None:
         try:
@@ -1356,7 +1557,16 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         log_dir: str = "logs",
         logger_type: str = "tensorboard",
         resume_checkpoint: str | None = None,
+        lifecycle_hook: LifecycleHook | None = None,
+        checkpoint_iterations: Sequence[int] = (),
     ) -> None:
+        validate_hook(lifecycle_hook)
+        self._lifecycle_hook = lifecycle_hook
+        self._lifecycle_stop_reason = None
+        self._lifecycle_pause_seconds = 0.0
+        self._checkpoint_iterations = validate_checkpoint_iterations(
+            checkpoint_iterations, max_iterations
+        )
         resume_start_iteration = 1
         if resume_checkpoint is not None:
             resume_start_iteration = self._restore_resume_checkpoint(resume_checkpoint)
@@ -1712,6 +1922,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             graph_manifest = self._cuda_graph_runtime_manifest()
             self.runtime_manifest["cuda_graph"] = graph_manifest
             logger.update_runtime_manifest(dict(self.runtime_manifest))
+            self._persist_runtime_manifest_snapshot(log_dir, phase="learner_prepared")
             self._shutdown_recorder.set_phase(owner="learner", phase="startup/collector_start")
 
             # --- start collector ---
@@ -1782,8 +1993,17 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
 
             training_e2e_start_ns = 0
 
+            graph_replay_snapshot_written = False
+            held_inference_request: int | None = None
+
             # ---- training loop ----
             for iteration in range(start_iteration, max_iterations + 1):
+                if self._lifecycle_hook is not None:
+                    self._lifecycle_hook(
+                        self._lifecycle_context(
+                            phase="iteration_start", iteration=iteration, log_dir=log_dir
+                        )
+                    )
                 self._shutdown_recorder.set_phase(
                     owner="learner",
                     phase="training/wait_for_inference_request",
@@ -1802,7 +2022,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 inference_time = 0.0
                 next_prepare_min_snapshot_ptr: int | None = None
                 while True:
-                    request_tick = self._wait_for_inference_request(
+                    wait_for_request = partial(
+                        self._wait_for_inference_request,
                         inference_request_queue,
                         expected_tick=inference_scheduler.next_tick,
                         replay_pipeline=replay_pipeline,
@@ -1815,6 +2036,15 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                         ckpt_path=ckpt_path,
                         train_start_wall=train_start_wall,
                     )
+                    if held_inference_request is None:
+                        request_tick = wait_for_request()
+                    else:
+                        request_tick = held_inference_request
+                        held_inference_request = None
+                        if request_tick != inference_scheduler.next_tick:
+                            raise RuntimeError(
+                                "Held milestone inference tick differs from scheduler"
+                            )
                     self._shutdown_recorder.set_phase(
                         owner="learner",
                         phase="training/learner_inference",
@@ -2050,6 +2280,19 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                                 deferred_cycle_metrics(),
                             ).items():
                                 iter_metrics[key].append(value)
+                        if not graph_replay_snapshot_written and bool(
+                            getattr(learner, "_update_cycle_replay_submitted", False)
+                        ):
+                            self.runtime_manifest["cuda_graph"] = (
+                                self._cuda_graph_runtime_manifest()
+                            )
+                            logger.update_runtime_manifest(dict(self.runtime_manifest))
+                            self._persist_runtime_manifest_snapshot(
+                                log_dir,
+                                phase="first_whole_cycle_replay_submitted",
+                                iteration=iteration,
+                            )
+                            graph_replay_snapshot_written = True
                     else:
 
                         def run_actor_update(
@@ -2165,6 +2408,16 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                                     iter_metrics[key].append(value)
 
                     replay_pipeline.after_tick()
+                    if bool(getattr(learner, "compile_actor_inference", False)) and (
+                        iteration == 1 or iteration % 1000 == 0
+                    ):
+                        self.runtime_manifest["cuda_graph"] = self._cuda_graph_runtime_manifest()
+                        logger.update_runtime_manifest(dict(self.runtime_manifest))
+                        self._persist_runtime_manifest_snapshot(
+                            log_dir,
+                            phase="compiled_update_progress",
+                            iteration=iteration,
+                        )
                     self._synchronize_after_update_phase(
                         torch.device(self.device),
                         phase_ordered_metrics=phase_ordered_metrics,
@@ -2255,7 +2508,11 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                     extra_info=log_payload["extra_info"],
                 )
 
-                if save_interval > 0 and iteration % save_interval == 0:
+                if (
+                    (save_interval > 0 and iteration % save_interval == 0)
+                    or iteration in self._checkpoint_iterations
+                    or (self._lifecycle_hook is not None and iteration == max_iterations)
+                ):
                     saved_path = self._save_checkpoint(
                         log_dir=log_dir,
                         iteration=iteration,
@@ -2263,6 +2520,28 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                     )
                     if saved_path is not None:
                         ckpt_path = saved_path
+                    if self._lifecycle_hook is not None:
+                        held_inference_request = self._checkpoint_lifecycle(
+                            iteration=iteration,
+                            log_dir=log_dir,
+                            replay_pipeline=replay_pipeline,
+                            wait_for_request=partial(
+                                self._wait_for_inference_request,
+                                inference_request_queue,
+                                expected_tick=inference_scheduler.next_tick,
+                                replay_pipeline=replay_pipeline,
+                                metrics_queue=metrics_queue,
+                                reward_history=reward_history,
+                                latest_reward_components=latest_reward_components,
+                                logger=logger,
+                                trace_recorder=trace_recorder,
+                                replay_buffer=replay_buffer,
+                                ckpt_path=ckpt_path,
+                                train_start_wall=train_start_wall,
+                            ),
+                        )
+                        if self._lifecycle_stop_reason is not None:
+                            break
 
             if trace_recorder:
                 trace_recorder.add_slice(
@@ -2320,11 +2599,14 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 self._record_final_replay_ingress_diagnostics(logger, replay_buffer)
             except BaseException as diagnostics_exc:
                 self._shutdown_recorder.record_cleanup_error(diagnostics_exc)
-            final_ckpt_path = os.path.join(log_dir, f"model_{max_iterations}.pt")
+            final_iteration = (
+                iteration if self._lifecycle_stop_reason is not None else max_iterations
+            )
+            final_ckpt_path = os.path.join(log_dir, f"model_{final_iteration}.pt")
             if ckpt_path != final_ckpt_path:
                 saved_path = self._save_checkpoint(
                     log_dir=log_dir,
-                    iteration=max_iterations,
+                    iteration=final_iteration,
                     logger=logger,
                 )
                 if saved_path is not None:
@@ -2348,6 +2630,22 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 train_start_wall,
                 str(trace_output_path) if trace_output_path else None,
             )
+            if self._lifecycle_hook is not None:
+                self.last_run_summary["requested_max_iterations"] = max_iterations
+                self.last_run_summary["termination"] = (
+                    "lifecycle_stop"
+                    if self._lifecycle_stop_reason is not None
+                    else "max_iterations"
+                )
+                self.last_run_summary["stop_reason"] = self._lifecycle_stop_reason
+                self.last_run_summary["lifecycle_pause_wall_time_sec"] = (
+                    self._lifecycle_pause_seconds
+                )
+                self.last_run_summary["training_active_wall_time_sec"] = max(
+                    0.0,
+                    cast(float, self.last_run_summary["training_wall_time_sec"])
+                    - self._lifecycle_pause_seconds,
+                )
             self._shutdown_recorder.record_normal_completion()
             self._record_shutdown_diagnostics(logger)
             self._active_logger = None
